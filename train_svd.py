@@ -52,13 +52,15 @@ from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate, is_wandb_available, load_image
 from diffusers.utils.import_utils import is_xformers_available
+# from diffusers.utils import logging
+# logging.set_verbosity_warning()
 
 from torch.utils.data import Dataset
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.24.0.dev0")
 
-logger = get_logger(__name__, log_level="INFO")
+logger = get_logger(__name__, )#log_level="INFO")
 
 # copy from https://github.com/crowsonkb/k-diffusion.git
 def stratified_uniform(shape, group=0, groups=1, dtype=None, device=None):
@@ -115,7 +117,8 @@ def rand_log_normal(shape, loc=0., scale=1., device='cpu', dtype=torch.float32):
 
 
 class DummyDataset(Dataset):
-    def __init__(self, num_samples=100000, width=1024, height=576, sample_frames=25):
+    def __init__(self, num_samples=100000, dataset='/mnt/data/sonia/occetc/vars3-25.04.05', 
+                 width=1024, height=576, sample_frames=25):
         """
         Args:
             num_samples (int): Number of samples in the dataset.
@@ -123,7 +126,7 @@ class DummyDataset(Dataset):
         """
         self.num_samples = num_samples
         # Define the path to the folder containing video frames
-        self.base_folder = '/mnt/data/sonia/occetc/outxtend'
+        self.base_folder = dataset
         self.folders = os.listdir(self.base_folder)
         self.channels = 3
         self.width = width
@@ -348,6 +351,13 @@ def parse_args():
         default='stabilityai/stable-video-diffusion-img2vid',
         required=False,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default='/mnt/data/sonia/occetc/vars3-25.04.05',
+        required=False,
+        help="Path to training dataset.",
     )
     parser.add_argument(
         "--revision",
@@ -669,12 +679,12 @@ def main():
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
+        # level=logging.INFO,
     )
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
         transformers.utils.logging.set_verbosity_warning()
-        diffusers.utils.logging.set_verbosity_info()
+        # diffusers.utils.logging.set_verbosity_info()
     else:
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
@@ -853,7 +863,7 @@ def main():
     # DataLoaders creation:
     args.global_batch_size = args.per_gpu_batch_size * accelerator.num_processes
 
-    train_dataset = DummyDataset(width=args.width, height=args.height, sample_frames=args.num_frames)
+    train_dataset = DummyDataset(dataset=args.dataset, width=args.width, height=args.height, sample_frames=args.num_frames)
     sampler = RandomSampler(train_dataset)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,

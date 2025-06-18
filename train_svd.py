@@ -118,7 +118,7 @@ def rand_log_normal(shape, loc=0., scale=1., device='cpu', dtype=torch.float32):
 
 class DummyDataset(Dataset):
     def __init__(self, num_samples=100000, dataset='/mnt/data/sonia/occetc/vars3-25.04.05', 
-                 width=1024, height=576, sample_frames=25):
+                 width=1024, height=576, channels=3, sample_frames=25):
         """
         Args:
             num_samples (int): Number of samples in the dataset.
@@ -127,8 +127,8 @@ class DummyDataset(Dataset):
         self.num_samples = num_samples
         # Define the path to the folder containing video frames
         self.base_folder = dataset
-        self.folders = os.listdir(self.base_folder)
-        self.channels = 3
+        self.folders = [f for f in os.listdir(self.base_folder) if os.path.isdir(os.path.join(self.base_folder, f))]
+        self.channels = channels
         self.width = width
         self.height = height
         self.sample_frames = sample_frames
@@ -160,13 +160,14 @@ class DummyDataset(Dataset):
         start_idx = random.randint(0, len(frames) - self.sample_frames)
         selected_frames = frames[start_idx:start_idx + self.sample_frames]
 
-        # Initialize a tensor to store the pixel values
-        pixel_values = torch.empty((self.sample_frames, self.channels, self.height, self.width))
+        # Initialize a tensor to store the pixel values (3 channels is baked into model)
+        pixel_values = torch.empty((self.sample_frames, 3, self.height, self.width))
 
         # Load and process each frame
         for i, frame_name in enumerate(selected_frames):
             frame_path = os.path.join(folder_path, frame_name)
-            with Image.open(frame_path) as img:
+            # with Image.open(frame_path) as img:
+            with Image.fromarray(np.load(frame_path)) as img:
                 # Resize the image and convert it to a tensor
                 img_resized = img.resize((self.width, self.height))
                 img_tensor = torch.from_numpy(np.array(img_resized)).float()
@@ -179,8 +180,9 @@ class DummyDataset(Dataset):
                     img_normalized = img_normalized.permute(
                         2, 0, 1)  # For RGB images
                 elif self.channels == 1:
-                    img_normalized = img_normalized.mean(
-                        dim=2, keepdim=True)  # For grayscale images
+                    img_normalized = img_normalized.unsqueeze(0).repeat([3,1,1])  
+                #     img_normalized = img_normalized.mean(
+                #         dim=2, keepdim=True)  # For grayscale images
 
                 pixel_values[i] = img_normalized
         return {'pixel_values': pixel_values}
@@ -386,6 +388,12 @@ def parse_args():
         "--height",
         type=int,
         default=576,
+    )
+    parser.add_argument(
+        "--channels",
+        type=int,
+        default=3,
+        help="Number of channels in the input images. Default is 3 for RGB images.",
     )
     parser.add_argument(
         "--num_validation_images",
@@ -863,7 +871,8 @@ def main():
     # DataLoaders creation:
     args.global_batch_size = args.per_gpu_batch_size * accelerator.num_processes
 
-    train_dataset = DummyDataset(dataset=args.dataset, width=args.width, height=args.height, sample_frames=args.num_frames)
+    train_dataset = DummyDataset(dataset=args.dataset, width=args.width, height=args.height, 
+                                 channels=args.channels, sample_frames=args.num_frames)
     sampler = RandomSampler(train_dataset)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -956,9 +965,13 @@ def main():
     ):
         add_time_ids = [fps, motion_bucket_id, noise_aug_strength]
 
-        passed_add_embed_dim = unet.module.config.addition_time_embed_dim * \
-            len(add_time_ids)
-        expected_add_embed_dim = unet.module.add_embedding.linear_1.in_features
+        # multi-gpu training: https://github.com/pixeli99/SVD_Xtend/issues/2
+        # passed_add_embed_dim = unet.config.addition_time_embed_dim * \
+        #     len(add_time_ids)
+        # expected_add_embed_dim = unet.modules.add_embedding.linear_1.in_features
+        # single-gpu training: https://github.com/pixeli99/SVD_Xtend/issues/2
+        passed_add_embed_dim = unet.config.addition_time_embed_dim * len(add_time_ids)
+        expected_add_embed_dim = unet.add_embedding.linear_1.in_features
 
         if expected_add_embed_dim != passed_add_embed_dim:
             raise ValueError(

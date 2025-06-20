@@ -11,8 +11,8 @@ import sys
 import contextlib
 import threading
 
-# trackspath='/home/sonia/mcms/tracker/1940-2010/era5/read_era5/out_era5_output_1940_2010.txt'
-trackspath='/home/sonia/mcms/tracker/2010-2024/era5/out_era5/era5/mcms_era5_2010_2024_tracks.txt'
+trackspath='/home/sonia/mcms/tracker/1940-2010/era5/read_era5/out_era5_output_1940_2010.txt'
+# trackspath='/home/sonia/mcms/tracker/2010-2024/era5/out_era5/era5/mcms_era5_2010_2024_tracks.txt'
 use_slp = False # whether to include slp channel
 threads = 32
 
@@ -85,7 +85,8 @@ def prep_point(df, client, thread=0):
     return boxes
 
 # %%
-sids = tracks['sid'].unique()
+sids = tracks[tracks['year'] <= 2010]['sid'].unique() # SIDS STARTING BEFORE 2010
+# sids = tracks['sid'].unique()
 RADIUS=6371 # Earth radius in km
 outpath = '/home/cyclone/train/windmag_natlantic'
 if not os.path.exists(outpath):
@@ -100,7 +101,10 @@ def worker(sids_chunk, thread_id):
     
     for i, sid in enumerate(sids_chunk):
         if i % 100 == 0:
-            print(f'Thread {thread_id}: Processing sid {i}/{len(sids_chunk)}: {i//len(sids_chunk)*100:.2f}% complete')
+            print(f'Thread {thread_id}: Processing sid {i}/{len(sids_chunk)}: {i/len(sids_chunk)*100:.2f}% complete')
+        
+        if os.path.exists(f'{outpath}/{sid}') and len(os.listdir(f'{outpath}/{sid}')) >= 8:
+            continue #already processed
         sid_df = tracks[tracks['sid'] == sid]
         start_lat = sid_df['lat'].iloc[0]
         start_lon = sid_df['lon'].iloc[0]

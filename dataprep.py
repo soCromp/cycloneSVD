@@ -80,38 +80,44 @@ x_lin = np.linspace(-l, l, s)
 y_lin = np.linspace(-l, l, s)
 x_grid, y_grid = np.meshgrid(x_lin, y_lin) # equal-spaced points from -l to l in both x and y dimensions
 
-cur_year = 1940 
+file_year = 1940 
 end_year = 2024
 cur_datas = {}
 next_datas = {}
 for var in varnames:
-    cur_data = xr.open_dataset(f'{varlocs[var]}/{var}.{cur_year}.nc', engine='netcdf4')
+    cur_data = xr.open_dataset(f'{varlocs[var]}/{var}.{file_year}.nc', engine='netcdf4')
     correct_time = cur_data['time'].values[0] + pd.to_timedelta(np.arange(cur_data.dims['time']) * 6, unit='h')
     cur_data = cur_data.assign_coords(time=correct_time) # incase it wasn't read in as 6hrly
     cur_datas[var] = cur_data
-    next_data = xr.open_dataset(f'{varlocs[var]}/{var}.{cur_year+1}.nc', engine='netcdf4')
+    next_data = xr.open_dataset(f'{varlocs[var]}/{var}.{file_year+1}.nc', engine='netcdf4')
     correct_time = next_data['time'].values[0] + pd.to_timedelta(np.arange(next_data.dims['time']) * 6, unit='h')
     next_data = next_data.assign_coords(time=correct_time) # incase it wasn't read in as 6hrly
     next_datas[var] = next_data
+print(cur_datas['wind'])
+print(next_datas['wind'])
 
 def prep_point(df, thread=0):
     """make one training datapoint. df contains year/../hr, lat, lon of center"""
     boxes = []
-    file_year = cur_year
+    global file_year
+    print(df['year'])
+    if df['year'].iloc[0] != file_year: # starts in next year, so we know no following storm will start in cur year
+        file_year += 1 # advance one year
+        for var in varnames:
+            cur_datas[var] = next_datas[var]
+            if file_year < end_year:
+                next_data = xr.open_dataset(f'{varlocs[var]}/{var}.{file_year+1}.nc', engine='netcdf4')
+                correct_time = next_data['time'].values[0] + pd.to_timedelta(np.arange(next_data.dims['time']) * 6, unit='h')
+                next_data = next_data.assign_coords(time=correct_time) # incase it wasn't read in as 6hrly
+                next_datas[var] = next_data
+            else:
+                next_datas[var] = None
+        print(cur_datas['wind'])
+        print(next_datas['wind'])
+            
     for _, frame in df.iterrows():
         year, month, day, hour = frame['year'], frame['month'], frame['day'], frame['hour']
         time = f'{year}-{month:02d}-{day:02d}T{hour:02d}:00:00'
-        if year != file_year: # go to next file year 
-            file_year += 1
-            for var in varnames:
-                cur_datas[var] = next_datas[var]
-                if file_year < end_year:
-                    next_data = xr.open_dataset(f'{varlocs[var]}/{var}.{file_year+1}.nc', engine='netcdf4')
-                    correct_time = next_data['time'].values[0] + pd.to_timedelta(np.arange(next_data.dims['time']) * 6, unit='h')
-                    next_data = next_data.assign_coords(time=correct_time) # incase it wasn't read in as 6hrly
-                    next_datas[var] = next_data
-                else:
-                    next_datas[var] = None
         
         lat_center, lon_center = frame['lat'], frame['lon']
         # 'aeqd': https://proj.org/en/stable/operations/projections/aeqd.html
@@ -127,7 +133,10 @@ def prep_point(df, thread=0):
         
         slices = []
         for var in varnames:
-            data = varfuncs[var](cur_datas[var], slice(lat_max, lat_min), slice(lon_min, lon_max), time)
+            if year == file_year:
+                data = varfuncs[var](cur_datas[var], slice(lat_max, lat_min), slice(lon_min, lon_max), time)
+            else:
+                data = varfuncs[var](next_datas[var], slice(lat_max, lat_min), slice(lon_min, lon_max), time)
             slices.append(data.sortby(['lat', 'lon']).squeeze().values)
         rawbox = np.stack(slices).squeeze() # squeeze -- only works with 1 channel for now
         # print(rawbox)

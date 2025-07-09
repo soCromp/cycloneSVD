@@ -1,5 +1,4 @@
 # nts: activate langchain_env 
-import cdsapi
 import logging
 from tqdm import tqdm
 import xarray as xr
@@ -15,17 +14,20 @@ from scipy.interpolate import RegularGridInterpolator
 
 ###### settings
 trackspath1='/home/sonia/mcms/tracker/1940-2010/era5/out_era5/era5/mcms_era5_1940_2010_tracks.txt'
-trackspath2='/home/sonia/mcms/tracker/2010-2024/era5/out_era5/era5/mcms_era5_2010_2024_tracks.txt'
+trackspath2='/home/cyclone/train/windmag_natlantic/FIXEDmcms_era5_2010_2024_tracks.txt'
 joinyear = 2010 # overlap for the track data
 use_slp = False # whether to include slp channel
 use_windmag = True #include wind magnitude channel
 use_winduv = False # (Not implemented) include wind u and v components channels
+skip_preexisting = True # skip existing datapoints
 threads = 1
-outpath = '/home/cyclone/train/windmag_natlantic'
+outpath = '/home/cyclone/train/windmag_natlantic_new'
 ###### 
 
 regmask = xr.open_dataset('/home/cyclone/regmask_0723_anl.nc')
 # atlantic ocean is regmask['reg_name'].values[109] # so 110 in regmaskoc values
+# atlantic: 110
+# pacific: 111
 reg_id = 110
 
 ####### make dataframe of all tracks 
@@ -80,7 +82,7 @@ x_lin = np.linspace(-l, l, s)
 y_lin = np.linspace(-l, l, s)
 x_grid, y_grid = np.meshgrid(x_lin, y_lin) # equal-spaced points from -l to l in both x and y dimensions
 
-file_year = 1940 
+file_year = 1940
 end_year = 2024
 cur_datas = {}
 next_datas = {}
@@ -170,15 +172,18 @@ def worker(sids_chunk, thread_id):
     for i, sid in enumerate(sids_chunk):
         if i % 100 == 0:
             print(f'Thread {thread_id}: Processing sid {i}/{len(sids_chunk)}: {i/len(sids_chunk)*100:.2f}% complete')
-        sid_df = tracks[tracks['sid'] == sid]
-        start_lat = sid_df['lat'].iloc[0]
-        start_lon = sid_df['lon'].iloc[0]
+        sid_df = tracks[(tracks['sid'] == sid)]
         if len(sid_df) < 8: # storm too short
             continue
-        elif sid_df[sid_df['tid']==sid]['lat'].abs().iloc[0] > 70:
+        start_lat = sid_df['lat'].iloc[0]
+        start_lon = sid_df['lon'].iloc[0]
+        # print(sid_df)
+        if sid_df['lat'].abs().iloc[0] > 70:
             continue # starts poleward of 70 degrees
-        elif start_lat < 0 or 110 not in regmask.sel(lono=start_lon, lato=start_lat, method='nearest')['regmaskoc'].values:
-            continue # only get north atlantic ocean area
+        elif start_lat < 0 or reg_id not in regmask.sel(lono=start_lon-180, lato=start_lat, method='nearest')['regmaskoc'].sel(reglev=1).values:
+            continue # only get desired ocean region area
+        elif skip_preexisting and os.path.exists(f'{outpath}/{sid}') and len(os.listdir(f'{outpath}/{sid}')) == 8:
+            continue # skip completed datapoints
         
         sid_df = sid_df.sort_values(by=['tid'])
         sid_df = sid_df.iloc[:8]  # only take the first 8 frames for debugging

@@ -42,6 +42,8 @@ from packaging import version
 from tqdm.auto import tqdm
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 from einops import rearrange
+import torchvision.transforms as T
+
 
 import diffusers
 from diffusers import StableVideoDiffusionPipeline
@@ -171,9 +173,16 @@ class DummyDataset(Dataset):
                 # Resize the image and convert it to a tensor
                 img_resized = img.resize((self.width, self.height))
                 img_tensor = torch.from_numpy(np.array(img_resized)).float()
+                img_tensor[img_tensor.isnan()] = 0.0
+                if img_tensor.isnan().sum()>0:
+                    raise ValueError(
+                        f"{img_tensor.isnan().sum()} NaN values found in the image tensor for frame {frame_name} in folder {chosen_folder}.")
+                elif img_tensor.isinf().sum()>0:
+                    raise ValueError(
+                        f"Inf values found in the image tensor for frame {frame_name} in folder {chosen_folder}.")
 
                 # Normalize the image by scaling pixel values to [-1, 1]
-                img_normalized = img_tensor / 127.5 - 1
+                img_normalized = img_tensor / 255
 
                 # Rearrange channels if necessary
                 if self.channels == 3:
@@ -1212,8 +1221,20 @@ def main():
                         ):
                             for val_img_idx in range(args.num_validation_images):
                                 num_frames = args.num_frames
+                                frame_path = '/home/cyclone/train/windmag_atlanticpacific/19880121120440013000/0.npy'
+                                img = Image.fromarray(np.load(frame_path))
+                                img_resized = img.resize((224,224))
+                                img_tensor = torch.from_numpy(np.array(img_resized)).float()
+                                img_tensor[img_tensor.isnan()] = 0.0
+                                img_normalized = img_tensor / 255
+                                img_normalized = img_normalized.unsqueeze(0).repeat([3,1,1]).unsqueeze(0)  
+                                print(img_normalized.shape)
+                                # img = torch.randn(1,3,224,224)
+                                # img[img>1] = 1.0
+                                # img[img<0] = 0
                                 video_frames = pipeline(
-                                    load_image('demo.png').resize((args.width, args.height)),
+                                    img_normalized,# Image.fromarray(img),
+                                    # load_image('demo.png').resize((args.width, args.height)),
                                     height=args.height,
                                     width=args.width,
                                     num_frames=num_frames,

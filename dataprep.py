@@ -19,6 +19,7 @@ joinyear = 2010 # overlap for the track data
 use_slp = False # whether to include slp channel
 use_windmag = True #include wind magnitude channel
 use_winduv = False # (Not implemented) include wind u and v components channels
+use_topo = False # include topography channel
 skip_preexisting = True # skip existing datapoints
 threads = 1
 outpath = '/home/cyclone/train/windmag_natlantic_new'
@@ -58,7 +59,8 @@ tracks = tracks[['year', 'month', 'day', 'hour', 'tid', 'sid', 'lat', 'lon']]
 
 ####### variables prep
 varnames = [] # list of variables that will be included in this output dataset
-varlocs = {'slp': '/home/cyclone/slp/', 'wind': '/home/cyclone/wind'} # where the source data is stored 
+varlocs = {'slp': '/home/cyclone/slp/', 'wind': '/home/cyclone/wind',
+           'topo': '/home/cyclone/topo.nc'} # where the source data is stored 
 varfuncs = {}
 if use_slp:
     varnames.append('slp')
@@ -73,6 +75,12 @@ if use_windmag:
         windmag = np.sqrt(u**2 + v**2)
         return windmag
     varfuncs['wind'] = f_wind
+topo = None
+if use_topo: 
+    varnames.append('topo')
+    topo = xr.open_dataset(varlocs['topo'], engine='netcdf4')
+    def f_topo(ds, lats, lons, time):
+        return ds.sel(lat=lats, lon=lons)['lsm']
 varnames, varfuncs
 
 resolution = 0.5 # resolution of data in degs

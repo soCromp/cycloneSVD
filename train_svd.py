@@ -33,6 +33,7 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch.utils.data import RandomSampler
+import torch.multiprocessing as mp
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -119,17 +120,17 @@ def rand_log_normal(shape, loc=0., scale=1., device='cpu', dtype=torch.float32):
 
 
 class DummyDataset(Dataset):
-    def __init__(self, num_samples=100000, dataset='/mnt/data/sonia/occetc/vars3-25.04.05', 
+    def __init__(self, dataset='/mnt/data/sonia/occetc/vars3-25.04.05', 
                  width=1024, height=576, channels=3, sample_frames=25):
         """
         Args:
             num_samples (int): Number of samples in the dataset.
             channels (int): Number of channels, default is 3 for RGB.
         """
-        self.num_samples = num_samples
         # Define the path to the folder containing video frames
         self.base_folder = dataset
         self.folders = [f for f in os.listdir(self.base_folder) if os.path.isdir(os.path.join(self.base_folder, f))]
+        self.num_samples = len(self.folders)
         self.channels = channels
         self.width = width
         self.height = height
@@ -195,6 +196,48 @@ class DummyDataset(Dataset):
 
                 pixel_values[i] = img_normalized
         return {'pixel_values': pixel_values}
+
+
+class MixDataset(Dataset):
+    def __init__(self, num_samples=10000, dataset1='/home/cyclone/train/windmag_npacific', dataset2='/home/cyclone/train/windmag_natlantic', 
+                 width=1024, height=576, channels=3, sample_frames=25, choicefunc=None, max_train_steps=10000, shared_step=None):
+        self.channels = channels 
+        self.width = width 
+        self.height = height 
+        self.sample_frames = sample_frames 
+        # self.step = 0 #initialize
+        self._shared_step = shared_step
+        if shared_step is None:
+            self._shared_step = mp.Value('i', 0)  # 'i' == signed int
+        self.max_train_steps = max_train_steps
+        self.dataset1 = DummyDataset(dataset=dataset1, width=width, 
+                                     height=height, channels=channels, sample_frames=sample_frames)
+        self.dataset2 = DummyDataset(dataset=dataset2, width=width, 
+                                     height=height, channels=channels, sample_frames=sample_frames)
+        self.num_samples = len(self.dataset1) + len(self.dataset2)
+        
+        if choicefunc == 'uniform':
+            self.choicefunc = lambda f: np.random.choice([0,1])
+        elif choicefunc == 'linear':
+            self.choicefunc = lambda f: np.random.choice([0, 1], p=[f, 1-f])
+        
+    def __len__(self):
+        return self.num_samples 
+    
+    def __getitem__(self, idx):
+        choice=self.choicefunc(self.step/self.max_train_steps)
+        if choice == 0:
+            return self.dataset1[idx]
+        else:
+            return self.dataset2[idx]
+        
+    def set_step(self, step):
+        with self._shared_step.get_lock():
+            self._shared_step.value = int(step)
+        
+    @property
+    def step(self):
+        return self._shared_step.value
 
 # resizing utils
 # TODO: clean up later
@@ -366,9 +409,21 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         type=str,
-        default='/mnt/data/sonia/occetc/vars3-25.04.05',
-        required=False,
+        required=True,
         help="Path to training dataset.",
+    )
+    parser.add_argument(
+        "--dataset2",
+        type=str,
+        required=False,
+        help="Path to secondary training dataset.",
+    )
+    parser.add_argument(
+        "--choice_func",
+        type=str,
+        default='uniform',
+        required=False,
+        help="Function to choose between primary and secondary datasets.",
     )
     parser.add_argument(
         "--revision",
@@ -876,12 +931,21 @@ def main():
                 rec_txt2.write(f'{name}\n')
         rec_txt1.close()
         rec_txt2.close()
+        
 
     # DataLoaders creation:
     args.global_batch_size = args.per_gpu_batch_size * accelerator.num_processes
 
-    train_dataset = DummyDataset(dataset=args.dataset, width=args.width, height=args.height, 
-                                 channels=args.channels, sample_frames=args.num_frames)
+    train_dataset=None
+    if args.dataset2 is not None:
+        shared_step = mp.Value('i', 0)
+        train_dataset = MixDataset(dataset1=args.dataset, dataset2=args.dataset2, width=args.width, height=args.height,
+                                   channels=args.channels, sample_frames=args.num_frames, 
+                                   choicefunc=args.choice_func, max_train_steps=args.max_train_steps, shared_step=shared_step)
+    else:
+        train_dataset = DummyDataset(dataset=args.dataset, width=args.width, height=args.height, 
+                                    channels=args.channels, sample_frames=args.num_frames)
+        
     sampler = RandomSampler(train_dataset)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -889,7 +953,7 @@ def main():
         batch_size=args.per_gpu_batch_size,
         num_workers=args.num_workers,
     )
-
+        
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(
@@ -897,6 +961,8 @@ def main():
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
+        
+    train_dataset.max_train_steps = args.max_train_steps
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
@@ -1026,6 +1092,7 @@ def main():
         unet.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
+            train_dataset.set_step(global_step)
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % args.gradient_accumulation_steps == 0:
@@ -1228,10 +1295,6 @@ def main():
                                 img_tensor[img_tensor.isnan()] = 0.0
                                 img_normalized = img_tensor / 255
                                 img_normalized = img_normalized.unsqueeze(0).repeat([3,1,1]).unsqueeze(0)  
-                                print(img_normalized.shape)
-                                # img = torch.randn(1,3,224,224)
-                                # img[img>1] = 1.0
-                                # img[img<0] = 0
                                 video_frames = pipeline(
                                     img_normalized,# Image.fromarray(img),
                                     # load_image('demo.png').resize((args.width, args.height)),
@@ -1268,6 +1331,8 @@ def main():
 
             if global_step >= args.max_train_steps:
                 break
+            
+        
 
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()

@@ -899,11 +899,12 @@ def main():
     # Customize the parameters that need to be trained; if necessary, you can uncomment them yourself.
 
     for name, para in unet.named_parameters():
-        if 'temporal_transformer_block' in name:
-            parameters_list.append(para)
-            para.requires_grad = True
-        else:
-            para.requires_grad = False
+        parameters_list.append(para)
+        # if 'temporal_transformer_block' in name:
+        #     parameters_list.append(para)
+        #     para.requires_grad = True
+        # else:
+        #     para.requires_grad = False
     optimizer = optimizer_cls(
         parameters_list,
         lr=args.learning_rate,

@@ -16,13 +16,13 @@ from scipy.interpolate import RegularGridInterpolator
 trackspath1='/home/sonia/mcms/tracker/1940-2010/era5/out_era5/era5/mcms_era5_1940_2010_tracks.txt'
 trackspath2='/home/cyclone/train/windmag_natlantic/FIXEDmcms_era5_2010_2024_tracks.txt'
 joinyear = 2010 # overlap for the track data
-use_slp = False # whether to include slp channel
-use_windmag = True #include wind magnitude channel
+use_slp = True # whether to include slp channel
+use_windmag = False #include wind magnitude channel
 use_winduv = False # (Not implemented) include wind u and v components channels
 use_topo = False # include topography channel
 skip_preexisting = True # skip existing datapoints
 threads = 1
-outpath = '/home/cyclone/train/windmag_natlantic_new'
+outpath = '/home/cyclone/train/slp_natlantic'
 ###### 
 
 regmask = xr.open_dataset('/home/cyclone/regmask_0723_anl.nc')
@@ -64,7 +64,7 @@ varlocs = {'slp': '/home/cyclone/slp/', 'wind': '/home/cyclone/wind',
 varfuncs = {}
 if use_slp:
     varnames.append('slp')
-    def f_slp(ds, lats, lons): # function to run when new SLP file is loaded
+    def f_slp(ds, lats, lons, time): # function to run when new SLP file is loaded
         return ds.sel(lat=lats, lon=lons, time=time)['slp']
     varfuncs['slp'] = f_slp
 if use_windmag:
@@ -103,8 +103,6 @@ for var in varnames:
     correct_time = next_data['time'].values[0] + pd.to_timedelta(np.arange(next_data.dims['time']) * 6, unit='h')
     next_data = next_data.assign_coords(time=correct_time) # incase it wasn't read in as 6hrly
     next_datas[var] = next_data
-print(cur_datas['wind'])
-print(next_datas['wind'])
 
 def prep_point(df, thread=0):
     """make one training datapoint. df contains year/../hr, lat, lon of center"""
@@ -122,8 +120,6 @@ def prep_point(df, thread=0):
                 next_datas[var] = next_data
             else:
                 next_datas[var] = None
-        print(cur_datas['wind'])
-        print(next_datas['wind'])
             
     for _, frame in df.iterrows():
         year, month, day, hour = frame['year'], frame['month'], frame['day'], frame['hour']

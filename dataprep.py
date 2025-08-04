@@ -16,13 +16,13 @@ from scipy.interpolate import RegularGridInterpolator
 trackspath1='/home/sonia/mcms/tracker/1940-2010/era5/out_era5/era5/mcms_era5_1940_2010_tracks.txt'
 trackspath2='/home/cyclone/train/windmag_natlantic/FIXEDmcms_era5_2010_2024_tracks.txt'
 joinyear = 2010 # overlap for the track data
-use_slp = True # whether to include slp channel
+use_slp = False # whether to include slp channel
 use_windmag = False #include wind magnitude channel
-use_winduv = False # (Not implemented) include wind u and v components channels
+use_winduv = True # include wind u and v components channels
 use_topo = False # include topography channel
-skip_preexisting = True # skip existing datapoints
+skip_preexisting = False # skip existing datapoints
 threads = 1
-outpath = '/home/cyclone/train/slp_natlantic'
+outpath = '/home/cyclone/train/winduv_natlantic'
 ###### 
 
 regmask = xr.open_dataset('/home/cyclone/regmask_0723_anl.nc')
@@ -75,6 +75,12 @@ if use_windmag:
         windmag = np.sqrt(u**2 + v**2)
         return windmag
     varfuncs['wind'] = f_wind
+if use_winduv:
+    varnames.append('wind')
+    def f_winduv(ds, lats, lons, time):
+        data = ds.sel(lat=lats, lon=lons, time=time)[['u10', 'v10']] 
+        return data
+    varfuncs['wind'] = f_winduv
 topo = None
 if use_topo: 
     varnames.append('topo')
@@ -137,28 +143,50 @@ def prep_point(df, thread=0):
         lat_max = lat_grid.max() + resolution
         # print(lat_max, lat_min, lon_min, lon_max)
         
-        slices = []
+        rawslices = []
         for var in varnames:
             if year == file_year:
                 data = varfuncs[var](cur_datas[var], slice(lat_max, lat_min), slice(lon_min, lon_max), time)
             else:
                 data = varfuncs[var](next_datas[var], slice(lat_max, lat_min), slice(lon_min, lon_max), time)
-            slices.append(data.sortby(['lat', 'lon']).squeeze().values)
-        rawbox = np.stack(slices).squeeze() # squeeze -- only works with 1 channel for now
-        # print(rawbox)
-        
-        # Build interpolator
-        interp = RegularGridInterpolator(
-            (data.lat.values, data.lon.values),
-            rawbox,
-            bounds_error=False,
-            fill_value=np.nan
-        )
+            rawslices.append(data.sortby(['lat', 'lon']))
+        # rawbox = np.stack(slices).squeeze() # squeeze -- only works with 1 channel for now
+        # print(rawbox.shape)
+        slices = []
+        for data in rawslices:
+            lats = data.lat.values 
+            lons = data.lon.values
+            data = data.to_array().squeeze().values
+            if data.ndim == 3: # for instance, wind u and v components
+                for i in range(data.shape[0]):
+                    sel = data[i]
+                    # Build interpolator
+                    interp = RegularGridInterpolator(
+                        (lats, lons),
+                        sel,
+                        bounds_error=False,
+                        fill_value=np.nan
+                    )
 
-        # Interpolate at new (lat, lon) pairs
-        interp_points = np.stack([lat_grid.ravel(), lon_grid.ravel()], axis=-1)
-        interp_values = interp(interp_points).reshape(s, s)
-        boxes.append(interp_values)
+                    # Interpolate at new (lat, lon) pairs
+                    interp_points = np.stack([lat_grid.ravel(), lon_grid.ravel()], axis=-1)
+                    interp_values = interp(interp_points).reshape(s, s)
+                    slices.append(interp_values)
+            else:
+                # Build interpolator
+                interp = RegularGridInterpolator(
+                    (lats, lons),
+                    data,
+                    bounds_error=False,
+                    fill_value=np.nan
+                )
+
+                # Interpolate at new (lat, lon) pairs
+                interp_points = np.stack([lat_grid.ravel(), lon_grid.ravel()], axis=-1)
+                interp_values = interp(interp_points).reshape(s, s)
+                slices.append(interp_values)
+        # boxes.append(interp_values)
+        boxes.append(np.stack(slices, axis=-1))
         
     datapoint = np.stack(boxes, axis=0)
     return datapoint

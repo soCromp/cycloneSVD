@@ -692,6 +692,12 @@ def parse_args():
         default=128,
         help=("The dimension of the LoRA update matrices."),
     )
+    parser.add_argument(
+        '--from_2d',
+        type=bool,
+        default=False,
+        help='if you want to run this code based off a 2d image model at the path pretrained_model_name_or_path'
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -786,12 +792,37 @@ def main():
     )
     vae = AutoencoderKLTemporalDecoder.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant="fp16")
-    unet = UNetSpatioTemporalConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path if args.pretrain_unet is None else args.pretrain_unet,
-        subfolder="unet",
-        low_cpu_mem_usage=True,
-        variant="fp16",
-    )
+    
+    if args.from_2d:
+        unet2d = diffusers.UNet2DConditionModel.from_pretrained(os.path.join(config.pretrained_model_name_or_path, 'unet'))
+        cfg      = dict(unet2d.config)
+        cfg['down_block_types'] = ['3D'.join(name.split('2D')) for name in cfg['down_block_types']]  
+        cfg['up_block_types'] = ['3D'.join(name.split('2D')) for name in cfg['up_block_types']]  
+        cfg['mid_block_type'] = '3D'.join(cfg['mid_block_type'].split('2D'))
+
+        # 2) build a fresh 3-D UNet with matching hyper-params
+        unet  = UNetSpatioTemporalConditionModel.from_config(cfg)
+        sd2 = unet2d.state_dict()
+        sd3 = unet.state_dict()
+        for k, w in sd2.items():
+            w3d = sd3.get(k, np.asarray([]))
+            if w.ndim == 4 and w3d.ndim==5:                                 # (O, I, H, W)
+                w3 = w.unsqueeze(2).repeat(1, 1, num_frames, 1, 1) # add time dimension
+                if time_avg:                                # Ho et al., 2022
+                    w3 /= num_frames
+                sd3[k] = w3
+            elif w.ndim > w3d.ndim:
+                sd3[k] = w.squeeze()
+            else: # no change
+                sd3[k] = w
+        unet.load_state_dict(sd3, strict=False)
+    else:
+        unet = UNetSpatioTemporalConditionModel.from_pretrained(
+            args.pretrained_model_name_or_path if args.pretrain_unet is None else args.pretrain_unet,
+            subfolder="unet",
+            low_cpu_mem_usage=True,
+            variant="fp16",
+        )
 
     # Freeze vae and image_encoder
     vae.requires_grad_(False)

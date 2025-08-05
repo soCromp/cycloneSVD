@@ -18,7 +18,7 @@ from tqdm.auto import tqdm
 from pathlib import Path
 import json
 import random
-
+import math
 
 
 config = {
@@ -31,7 +31,7 @@ config = {
     'lr_warmup_steps': 0,
     'save_image_epochs': 5,
     'save_model_epochs': 10,
-    'output_dir': "video1e-7",  # the model name locally and on the HF Hub
+    'output_dir': "video1e-7_corr",  # the model name locally and on the HF Hub
     'seed': 0,
     'dataset': '/home/cyclone/train/windmag_natlantic',
     'channels': 1, # channels in the images
@@ -39,6 +39,7 @@ config = {
     'continue': False,
     'img_model': 'img1e-7',
     'dtype': torch.float32,
+    'correlated_noise': 0.95, # 0 is iid
 }
 
 
@@ -219,6 +220,19 @@ lr_scheduler = get_cosine_schedule_with_warmup(
 #                                 choicefunc=args.choice_func, max_train_steps=args.max_train_steps, shared_step=shared_step)
 # else:
 
+# generate iid (rho==0) or correlated noise
+def noisef(shape, rho=0, device=None, dtype=None, generator=None):
+    # shape: (B, C, F, H, W)
+    B, C, F, H, W = shape
+    n = torch.randn(B, C, F, H, W, device=device, dtype=dtype, generator=generator)
+    if F <= 1 or rho <= 0:  # falls back to i.i.d. noise
+        return n
+    s = math.sqrt(1 - rho * rho)
+    n[:, :, 1:] = rho * n[:, :, :-1] + s * torch.randn(n[:, :, 1:].size(), dtype=dtype,
+                        layout=n.layout, device=device, generator=generator)
+    return n
+
+
 
 class CondDiffusionPipeline(DiffusionPipeline):
     def __init__(self, unet, scheduler):
@@ -306,9 +320,9 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
             clean_images = torch.as_tensor(batch["pixel_values"], device='cuda', dtype=config['dtype'])
             zeros = torch.zeros((config['train_batch_size'], 1, cross_attention_dim), 
                                 device=accelerator.device, dtype=config['dtype'])
-            # print(clean_images.min(), clean_images.max())
             
-            noise = torch.randn(clean_images.shape, device=clean_images.device, dtype=config['dtype'])
+            # noise = torch.randn(clean_images.shape, device=clean_images.device, dtype=config['dtype'])
+            noise = noisef(clean_images.shape, rho=config['correlated_noise'], device=clean_images.device, dtype=config['dtype'])
             bs = clean_images.shape[0]
             timesteps = torch.randint(
                 0, noise_scheduler.config['num_train_timesteps'], (bs,), device=clean_images.device,

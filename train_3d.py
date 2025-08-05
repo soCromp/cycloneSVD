@@ -29,7 +29,7 @@ config = {
     'gradient_accumulation_steps': 8,
     'learning_rate': 1e-7,
     'lr_warmup_steps': 0,
-    'save_image_epochs': 5,
+    'save_image_epochs': 10,
     'save_model_epochs': 10,
     'output_dir': "video1e-7_corr",  # the model name locally and on the HF Hub
     'seed': 0,
@@ -243,21 +243,28 @@ class CondDiffusionPipeline(DiffusionPipeline):
         
     @torch.no_grad()
     def __call__(self, input, num_frames=8, generator=None, encoder_hidden_states=None, **kwargs):
-        """Input should be [batch_size, channels, 1, height, width], where frame=1 is the prompt frame"""
+        """Input should be [batch_size, channels, 1, height, width], where frame=0 is the prompt frame"""
         device = self.unet.device
         batch_size = input.shape[0]
-        sample  = torch.randn(
-            batch_size, self.unet.config['out_channels'], num_frames, 32, 32,
-            generator=generator, device=device
+        noise  = noisef(
+            (batch_size, self.unet.config['in_channels'], num_frames, config['image_size'], config['image_size']),
+            generator=generator, device=device, dtype=config['dtype']
         )
-        sample[:, :, 0, :, :] = input
+        sample = noise.clone()
+        prompt = input.to(device=device, dtype=config['dtype'])
         
-        for t in self.scheduler.timesteps:
+        for i, t in enumerate(self.scheduler.timesteps):
             eps = self.unet(sample, t, encoder_hidden_states=encoder_hidden_states).sample
-            sample = self.scheduler.step(eps, t, sample).prev_sample
-            sample[:, :, 0, :, :] = input
+            sample = self.scheduler.step(eps, t, sample, generator=generator).prev_sample
+            t_prev = self.scheduler.timesteps[i+1] if i+1 < len(self.scheduler.timesteps) else t
+            z = torch.randn((batch_size, self.unet.config['in_channels'], config['image_size'], config['image_size']), 
+                            device=device, dtype=config['dtype'], generator=generator)
+            # z = noisef((batch_size, self.unet.config.in_channels, num_frames, config['image_size'], config['image_size']),
+            #     generator=generator, device=device, dtype=dtype)[:, :, 0]
+            sample[:, :, 0, :, :] = self.scheduler.add_noise(prompt, z, t_prev)
             
         return {"images": sample.cpu()}
+
 
 def evaluate(samples, config, epoch, pipeline):
     # Sample some images from random noise (this is the backward diffusion process).

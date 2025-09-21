@@ -14,22 +14,23 @@ from scipy.interpolate import RegularGridInterpolator
 
 ###### settings
 trackspath1='/home/sonia/mcms/tracker/1940-2010/era5/out_era5/era5/mcms_era5_1940_2010_tracks.txt'
-trackspath2='/home/cyclone/train/windmag_natlantic/FIXEDmcms_era5_2010_2024_tracks.txt'
+trackspath2='/home/sonia/mcms/tracker/2010-2024/era5/out_era5/era5/FIXEDmcms_era5_2010_2024_tracks.txt'
 joinyear = 2010 # overlap for the track data
 use_slp = False # whether to include slp channel
-use_windmag = False #include wind magnitude channel
-use_winduv = True # include wind u and v components channels
+use_windmag = False #include wind magnitude channel # NOTE THIS IS 500hPa
+use_winduv = True # include wind u and v components channels # NOTE THIS IS 500hPa
 use_topo = False # include topography channel
-skip_preexisting = False # skip existing datapoints
+skip_preexisting = False # skip existing datapoints (ensures they have 8 frames)
 threads = 1
-outpath = '/home/cyclone/train/winduv_natlantic'
+outpath = '/home/cyclone/train/winduv/500hpa/npacific'
 ###### 
 
 regmask = xr.open_dataset('/home/cyclone/regmask_0723_anl.nc')
 # atlantic ocean is regmask['reg_name'].values[109] # so 110 in regmaskoc values
 # atlantic: 110
 # pacific: 111
-reg_id = 110
+reg_id = 111
+hemi = 'n' # n or s
 
 ####### make dataframe of all tracks 
 tracks1 = pd.read_csv(trackspath1, sep=' ', header=None, 
@@ -59,7 +60,8 @@ tracks = tracks[['year', 'month', 'day', 'hour', 'tid', 'sid', 'lat', 'lon']]
 
 ####### variables prep
 varnames = [] # list of variables that will be included in this output dataset
-varlocs = {'slp': '/home/cyclone/slp/', 'wind': '/home/cyclone/wind',
+varlocs = {'slp': '/home/cyclone/slp/', #'wind10m': '/home/cyclone/wind',
+           'wind': '/home/cyclone/wind_500hpa',
            'topo': '/home/cyclone/topo.nc'} # where the source data is stored 
 varfuncs = {}
 if use_slp:
@@ -78,7 +80,7 @@ if use_windmag:
 if use_winduv:
     varnames.append('wind')
     def f_winduv(ds, lats, lons, time):
-        data = ds.sel(lat=lats, lon=lons, time=time)[['u10', 'v10']] 
+        data = ds.sel(lat=lats, lon=lons, time=time)[['u', 'v']] # for 10m: [['u10', 'v10']] 
         return data
     varfuncs['wind'] = f_winduv
 topo = None
@@ -116,7 +118,7 @@ def prep_point(df, thread=0):
     global file_year
     print(df['year'])
     if df['year'].iloc[0] != file_year: # starts in next year, so we know no following storm will start in cur year
-        file_year += 1 # advance one year
+        file_year = df['year'].iloc[0] # advance one year (or more if there were no storms in this year / we skip already processed points)
         for var in varnames:
             cur_datas[var] = next_datas[var]
             if file_year < end_year:
@@ -156,8 +158,8 @@ def prep_point(df, thread=0):
         for data in rawslices:
             lats = data.lat.values 
             lons = data.lon.values
-            data = data.to_array().squeeze().values
-            if data.ndim == 3: # for instance, wind u and v components
+            if data.to_array().shape[0] > 1: # for instance, wind u and v components
+                data = data.to_array().squeeze().values
                 for i in range(data.shape[0]):
                     sel = data[i]
                     # Build interpolator
@@ -172,7 +174,8 @@ def prep_point(df, thread=0):
                     interp_points = np.stack([lat_grid.ravel(), lon_grid.ravel()], axis=-1)
                     interp_values = interp(interp_points).reshape(s, s)
                     slices.append(interp_values)
-            else:
+            else: # just one channel (eg slp)
+                data = np.asarray(data).squeeze()
                 # Build interpolator
                 interp = RegularGridInterpolator(
                     (lats, lons),
@@ -188,7 +191,7 @@ def prep_point(df, thread=0):
         # boxes.append(interp_values)
         boxes.append(np.stack(slices, axis=-1))
         
-    datapoint = np.stack(boxes, axis=0)
+    datapoint = np.stack(boxes, axis=0).squeeze()
     return datapoint
 
 sids = tracks['sid'].unique()
@@ -209,13 +212,14 @@ def worker(sids_chunk, thread_id):
             continue
         start_lat = sid_df['lat'].iloc[0]
         start_lon = sid_df['lon'].iloc[0]
-        # print(sid_df)
-        if sid_df['lat'].abs().iloc[0] > 70:
-            continue # starts poleward of 70 degrees
-        elif start_lat < 0 or reg_id not in regmask.sel(lono=start_lon-180, lato=start_lat, method='nearest')['regmaskoc'].sel(reglev=1).values:
-            continue # only get desired ocean region area
-        elif skip_preexisting and os.path.exists(f'{outpath}/{sid}') and len(os.listdir(f'{outpath}/{sid}')) == 8:
+
+        if skip_preexisting and os.path.exists(f'{outpath}/{sid}') and len(os.listdir(f'{outpath}/{sid}')) == 8:
             continue # skip completed datapoints
+        elif sid_df['lat'].abs().iloc[0] > 70:
+            continue # starts poleward of 70 degrees
+        elif (hemi == 'n' and start_lat < 0) or (hemi == 's' and start_lat >= 0) or \
+            (reg_id not in regmask.sel(lono=start_lon-180, lato=start_lat, method='nearest')['regmaskoc'].sel(reglev=1).values):
+            continue # only get desired ocean region area
         
         sid_df = sid_df.sort_values(by=['tid'])
         sid_df = sid_df.iloc[:8]  # only take the first 8 frames for debugging

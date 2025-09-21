@@ -417,6 +417,7 @@ def parse_args():
         type=str,
         required=False,
         help="Path to secondary training dataset.",
+        default=None,
     )
     parser.add_argument(
         "--choice_func",
@@ -971,11 +972,13 @@ def main():
     train_dataset=None
     if args.dataset2 is not None:
         shared_step = mp.Value('i', 0)
-        train_dataset = MixDataset(dataset1=args.dataset, dataset2=args.dataset2, width=args.width, height=args.height,
+        train_dataset = MixDataset(dataset1=os.path.join(args.dataset, 'train'), dataset2=os.path.join(args.dataset2, 'train'), 
+                                   width=args.width, height=args.height,
                                    channels=args.channels, sample_frames=args.num_frames, 
                                    choicefunc=args.choice_func, max_train_steps=args.max_train_steps, shared_step=shared_step)
     else:
-        train_dataset = DummyDataset(dataset=args.dataset, width=args.width, height=args.height, 
+        train_dataset = DummyDataset(dataset=os.path.join(args.dataset, 'train'), 
+                                     width=args.width, height=args.height, 
                                     channels=args.channels, sample_frames=args.num_frames)
         
     sampler = RandomSampler(train_dataset)
@@ -995,6 +998,17 @@ def main():
         overrode_max_train_steps = True
         
     train_dataset.max_train_steps = args.max_train_steps
+    
+    val_prompt_names = sorted(os.listdir(os.path.join(args.dataset, 'val')))[:args.num_validation_images]
+    val_prompts = [] 
+    for name in val_prompt_names:
+        img = Image.fromarray(np.load(os.path.join(args.dataset, 'val', name, '0.npy'))).resize((224,224))
+        # 224 is hard coded in SVD model
+        img_tensor = torch.from_numpy(np.array(img)).float() 
+        img_tensor[img_tensor.isnan()] = 0.0 
+        img_normalized = img_tensor / 255
+        img_normalized = img_normalized.unsqueeze(0).repeat([3,1,1]).unsqueeze(0)
+        val_prompts.append(img_normalized)
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
@@ -1124,7 +1138,8 @@ def main():
         unet.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
-            train_dataset.set_step(global_step)
+            if args.dataset2 is not None:
+                train_dataset.set_step(global_step)
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % args.gradient_accumulation_steps == 0:
@@ -1318,15 +1333,8 @@ def main():
                         with torch.autocast(
                             str(accelerator.device).replace(":0", ""), enabled=accelerator.mixed_precision == "fp16"
                         ):
-                            for val_img_idx in range(args.num_validation_images):
-                                num_frames = args.num_frames
-                                frame_path = '/home/cyclone/train/windmag_atlanticpacific/19880121120440013000/0.npy'
-                                img = Image.fromarray(np.load(frame_path))
-                                img_resized = img.resize((224,224))
-                                img_tensor = torch.from_numpy(np.array(img_resized)).float()
-                                img_tensor[img_tensor.isnan()] = 0.0
-                                img_normalized = img_tensor / 255
-                                img_normalized = img_normalized.unsqueeze(0).repeat([3,1,1]).unsqueeze(0)  
+                            for name, prompt in zip(val_prompt_names, val_prompts):
+                                num_frames = args.num_frames 
                                 video_frames = pipeline(
                                     img_normalized,# Image.fromarray(img),
                                     # load_image('demo.png').resize((args.width, args.height)),
@@ -1342,13 +1350,45 @@ def main():
 
                                 out_file = os.path.join(
                                     val_save_dir,
-                                    f"step_{global_step}_val_img_{val_img_idx}.mp4",
+                                    f"step_{global_step}_val_img_{name}.mp4",
                                 )
 
                                 for i in range(num_frames):
                                     img = video_frames[i]
                                     video_frames[i] = np.array(img)
                                 export_to_gif(video_frames, out_file, 8)
+                                
+                            # for val_img_idx in range(args.num_validation_images):
+                            #     num_frames = args.num_frames
+                            #     frame_path = '/home/cyclone/train/windmag_atlanticpacific/19880121120440013000/0.npy'
+                            #     img = Image.fromarray(np.load(frame_path))
+                            #     img_resized = img.resize((224,224))
+                            #     img_tensor = torch.from_numpy(np.array(img_resized)).float()
+                            #     img_tensor[img_tensor.isnan()] = 0.0
+                            #     img_normalized = img_tensor / 255
+                            #     img_normalized = img_normalized.unsqueeze(0).repeat([3,1,1]).unsqueeze(0)  
+                            #     video_frames = pipeline(
+                            #         img_normalized,# Image.fromarray(img),
+                            #         # load_image('demo.png').resize((args.width, args.height)),
+                            #         height=args.height,
+                            #         width=args.width,
+                            #         num_frames=num_frames,
+                            #         decode_chunk_size=8,
+                            #         motion_bucket_id=127,
+                            #         fps=7,
+                            #         noise_aug_strength=0.02,
+                            #         # generator=generator,
+                            #     ).frames[0]
+
+                            #     out_file = os.path.join(
+                            #         val_save_dir,
+                            #         f"step_{global_step}_val_img_{val_img_idx}.mp4",
+                            #     )
+
+                            #     for i in range(num_frames):
+                            #         img = video_frames[i]
+                            #         video_frames[i] = np.array(img)
+                            #     export_to_gif(video_frames, out_file, 8)
 
                         if args.use_ema:
                             # Switch back to the original UNet parameters.

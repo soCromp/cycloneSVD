@@ -1,7 +1,8 @@
 import numpy as np 
 import os 
 import sys 
-from utils.fvd import compute_fvd
+from utils.video_metrics import compute_fvd, compute_kvd
+from utils.forecast_metrics import compute_rmse
 import random
 
 train_path = sys.argv[1] 
@@ -19,11 +20,26 @@ def load_data(path):
             data.append(np.stack(point, axis=0))
     return np.stack(data, axis = 0)
 
-def get_fvd(train, synth, model=None):
+
+def get_fvd(train, synth, encoder=None):
     train_nonan = np.nan_to_num(train)
     synth_nonan = np.nan_to_num(synth)
-    fvd, encoder = compute_fvd(train_nonan, synth_nonan, )
-    return fvd
+    fvd, encoder = compute_fvd(train_nonan, synth_nonan, encoder=encoder)
+    return fvd, encoder
+
+
+def get_kvd(train, synth, encoder=None):
+    train_nonan = np.nan_to_num(train)
+    synth_nonan = np.nan_to_num(synth)
+    kvd, _, _, _ = compute_kvd(train_nonan, synth_nonan, encoder=encoder)
+    return kvd
+
+
+def get_rmse(train, synth):
+    if train.ndim == 4:
+        train = train.unsqueeze(-1)
+        synth = synth.unsqueeze(-1)
+    _, T, H, W, V = train.shape
 
 
 train = load_data(train_path)
@@ -35,5 +51,6 @@ synth = load_data(synth_path)
 
 print('train', train.shape, 'synth', synth.shape)
 
-fvd = get_fvd(train, synth)
-print(fvd)
+fvd, encoder = get_fvd(train, synth)
+kvd = get_kvd(train, synth, encoder=encoder)
+print('fvd', fvd, 'kvd', kvd)

@@ -1,6 +1,9 @@
-# rmse_accumulator.py
 import numpy as np
 from dataclasses import dataclass
+
+# Outline:
+# - RMSE metric (stats class and accumulator object)
+# - Anomaly correlation
 
 def _nan_to_num(x):
     return np.where(np.isfinite(x), x, 0.0)
@@ -63,11 +66,12 @@ class RmseAccumulator:
     Streaming RMSE for batches of forecasts.
     y_pred, y_true : (B, T, H, W, V) per batch (float32 ok)
     standardize: z-score using training-set mean/std per variable (V,)
-    var_weights: (V,), spatial_weights: (H,W), mask: broadcastable to (B,T,H,W,1)
+    var_weights: (V,), 
+    mask: broadcastable to (B,T,H,W,1)
     """
     def __init__(self, T, H, W, V,
-                 mean_per_var=None, std_per_var=None, standardize=False,
-                 var_weights=None, spatial_weights=None):
+                 mean_per_var=None, std_per_var=None, 
+                 standardize=False, var_weights=None, ):
         self.T, self.H, self.W, self.V = T, H, W, V
         self.standardize = standardize
 
@@ -84,8 +88,6 @@ class RmseAccumulator:
         # weights, pre-broadcasted
         self.vw = np.ones((1,1,1,1,V), dtype=np.float64) if var_weights is None \
                   else np.asarray(var_weights, dtype=np.float64).reshape(1,1,1,1,V)
-        self.sw = np.ones((1,1,H,W,1), dtype=np.float64) if spatial_weights is None \
-                  else np.asarray(spatial_weights, dtype=np.float64).reshape(1,1,H,W,1)
 
         self.stats = RmseStats.init(T, V)
 
@@ -104,7 +106,7 @@ class RmseAccumulator:
         yt = self._prep(y_true)
 
         # weights (B,T,H,W,V)
-        base_w = self.vw * self.sw
+        base_w = self.vw
         if mask is not None:
             mk = np.asarray(mask, dtype=np.float64)
             # allow (B,H,W), (B,1,H,W), or (B,T,H,W)
@@ -151,3 +153,6 @@ class RmseAccumulator:
 
     def results(self):
         return self.stats.finalize()
+
+
+

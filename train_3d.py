@@ -22,6 +22,7 @@ import math
 
 
 config = {
+    'train': False,
     'image_size': 32,  # the generated image resolution
     'train_batch_size': 8,
     'eval_batch_size': 1,  # how many images to sample during evaluation
@@ -33,7 +34,7 @@ config = {
     'save_model_epochs': 10,
     'output_dir': "video1e-7_corr",  # the model name locally and on the HF Hub
     'seed': 0,
-    'dataset': '/home/cyclone/train/windmag_natlantic',
+    'dataset': '/home/cyclone/train/windmag/10m/natlantic2/val',
     'channels': 1, # channels in the images
     'frames': 8,
     'continue': False,
@@ -82,7 +83,7 @@ class DummyDataset(Dataset):
             dict: A dictionary containing the 'pixel_values' tensor of shape (16, channels, 320, 512).
         """
         # Randomly select a folder (representing a video) from the base folder
-        chosen_folder = random.choice(self.folders)
+        chosen_folder = self.folders[idx] # random.choice(self.folders)
         folder_path = os.path.join(self.base_folder, chosen_folder)
         frames = sorted(os.listdir(folder_path))[:self.sample_frames]
 
@@ -120,7 +121,7 @@ class DummyDataset(Dataset):
                 #         dim=2, keepdim=True)  # For grayscale images
 
                 pixel_values[:, i, :, :] = img_normalized
-        return {'pixel_values': pixel_values}
+        return {'pixel_values': pixel_values, 'name': chosen_folder}
     
 
 class MixDataset(Dataset):
@@ -186,14 +187,16 @@ def image_to_video_model(config, time_avg=True):
     unet2d = None
     return unet3d
 
-if not config.get('continue', False): 
+if not config.get('continue', False) and config['train']: 
     unet = image_to_video_model(config)
     noise_scheduler = diffusers.DDPMScheduler.from_pretrained(
         config['img_model'], subfolder='scheduler', revision='main')
     start_epoch = 0
-else: # resume training
+else: # sample or resume training
+    print('loading model')
     unet = diffusers.UNet3DConditionModel.from_pretrained(
         config['output_dir'], subfolder="unet", revision="main")
+    print('here')
     noise_scheduler = diffusers.DDPMScheduler.from_pretrained(
         config['output_dir'], subfolder='scheduler', revision='main')
     with open(os.path.join(config['output_dir'], 'train_log.txt'), 'r') as f:
@@ -372,6 +375,29 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
             if (epoch + 1) % config['save_model_epochs'] == 0 or epoch == config['num_epochs'] - 1: # MODEL
                 pipeline.save_pretrained(config['output_dir'])
         
-
-train_loop(config, unet, noise_scheduler, optimizer, dataloader, lr_scheduler)
-    
+        
+def sample_loop(config, model, noise_scheduler, dataloader):
+    os.makedirs(os.path.join(config['output_dir'], 'samples'), exist_ok=True)
+    pipeline = CondDiffusionPipeline(unet=model, scheduler=noise_scheduler)
+    generator = torch.Generator(device='cuda').manual_seed(config['seed'])
+    for batch in tqdm(dataloader):
+        prompt = batch['pixel_values'][:, :, 0, :, :]
+        images = pipeline(
+            torch.as_tensor(prompt, dtype=config['dtype'], device='cuda'),
+            num_frames=config['frames'],
+            generator=generator, 
+            encoder_hidden_states=torch.zeros((config['train_batch_size'], 1, cross_attention_dim), device='cuda')
+        )['images']
+        # output from model is on [-1,1]  scale; convert to [0,255]
+        images = 255/2 * ( 1+np.array(images) )
+        for i, name in enumerate(batch['name']):
+            os.makedirs(os.path.join(config['output_dir'], 'samples', name), exist_ok=True)
+            for t in range(config['frames']):
+                np.save(os.path.join(config['output_dir'], 'samples', name, f'{t}.npy'), 
+                        images[i, :, t, :, :])
+        
+        
+if config['train']:
+    train_loop(config, unet, noise_scheduler, optimizer, dataloader, lr_scheduler)
+else:
+    sample_loop(config, unet, noise_scheduler, dataloader)

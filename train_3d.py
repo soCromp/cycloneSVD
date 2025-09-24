@@ -19,29 +19,64 @@ from pathlib import Path
 import json
 import random
 import math
+import wandb 
+import argparse
+import subprocess
 
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--train', action="store_true")
+    parser.add_argument('--image_size', type=int, default=32, help='the height and the width of the images')
+    parser.add_argument('--train_batch_size', type=int, default=8)
+    parser.add_argument('--eval_batch_size', type=int, default=8)
+    parser.add_argument('--num_epochs', type=int, default=250, help='if train=True, total number of epochs to train for')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=8)
+    parser.add_argument('--learning_rate', type=float, default=1e-7)
+    parser.add_argument('--lr_warmup_steps', type=int, default=0)
+    parser.add_argument('--save_image_epochs', type=int, default=10, help='how often to sample (eval) during training')
+    parser.add_argument('--save_model_epochs', type=int, default=10, help='how often to save model during training')
+    parser.add_argument('--name', type=str, default='debug', help='name of this run. Directory will be checkpoint_dir+name')
+    parser.add_argument('--checkpoint_dir', type=str, default='/mnt/data/sonia/cyclone/checkpoints')
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--dataset', type=str, required=True, help='path to training data, or val data for sampling')
+    parser.add_argument('--channels', type=int, default=1)
+    parser.add_argument('--frames', type=int, default=8)
+    parser.add_argument('--continue', type=bool, default=False, 
+                        help='if true and training true, attempt to resume training. uses training configs specified here')
+    parser.add_argument('--img_model', type=str, 
+                        default=None, help='if training video from scratch, builds from this image model')
+    parser.add_argument('--correlated_noise', type=float, default=0.95, help='0 is iid noise')
+    args = parser.parse_args()
+    return args
 
-config = {
-    'train': False,
-    'image_size': 32,  # the generated image resolution
-    'train_batch_size': 8,
-    'eval_batch_size': 1,  # how many images to sample during evaluation
-    'num_epochs': 250,
-    'gradient_accumulation_steps': 8,
-    'learning_rate': 1e-7,
-    'lr_warmup_steps': 0,
-    'save_image_epochs': 10,
-    'save_model_epochs': 10,
-    'output_dir': "video1e-7_corr",  # the model name locally and on the HF Hub
-    'seed': 0,
-    'dataset': '/home/cyclone/train/windmag/10m/natlantic2/val',
-    'channels': 1, # channels in the images
-    'frames': 8,
-    'continue': False,
-    'img_model': 'img1e-7',
-    'dtype': torch.float32,
-    'correlated_noise': 0.95, # 0 is iid
-}
+args = get_args()
+config = vars(args)
+config['dtype'] = torch.float32
+
+wandb.login()
+
+# config = {
+#     'train': True,
+#     'image_size': 32,  # the generated image resolution
+#     'train_batch_size': 8,
+#     'eval_batch_size': 1,  # how many images to sample during evaluation
+#     'num_epochs': 250,
+#     'gradient_accumulation_steps': 8,
+#     'learning_rate': 1e-7,
+#     'lr_warmup_steps': 0,
+#     'save_image_epochs': 10,
+#     'save_model_epochs': 10,
+#     'name': "debug", #will be saved to checkpoint_dir+name
+#     'checkpoint_dir': '/mnt/data/sonia/cyclone/checkpoints',
+#     'seed': 0,
+#     'dataset': '/home/cyclone/train/windmag/10m/natlantic2/val',
+#     'channels': 1, # channels in the images
+#     'frames': 8,
+#     'continue': False,
+#     'img_model': 'img1e-7',
+#     'dtype': torch.float32,
+#     'correlated_noise': 0.95, # 0 is iid
+# }
 
 
 class DummyDataset(Dataset):
@@ -193,13 +228,11 @@ if not config.get('continue', False) and config['train']:
         config['img_model'], subfolder='scheduler', revision='main')
     start_epoch = 0
 else: # sample or resume training
-    print('loading model')
     unet = diffusers.UNet3DConditionModel.from_pretrained(
-        config['output_dir'], subfolder="unet", revision="main")
-    print('here')
+        os.path.join(config['checkpoint_dir'], config['name']), subfolder="unet", revision="main")
     noise_scheduler = diffusers.DDPMScheduler.from_pretrained(
-        config['output_dir'], subfolder='scheduler', revision='main')
-    with open(os.path.join(config['output_dir'], 'train_log.txt'), 'r') as f:
+        os.path.join(config['checkpoint_dir'], config['name']), subfolder='scheduler', revision='main')
+    with open(os.path.join(config['checkpoint_dir'], config['name'], 'train_log.txt'), 'r') as f:
         logs = f.readlines()
     start_epoch = int(logs[-1].split()[1][:-1]) + 1
     
@@ -284,13 +317,13 @@ def evaluate(samples, config, epoch, pipeline):
     # output from model is on [-1,1]  scale; convert to [0,255]
     images = 255/2 * ( 1+np.array(images) )
     
-    test_dir = os.path.join(config['output_dir'], "samples")
-    os.makedirs(test_dir, exist_ok=True)
+    samples_dir = os.path.join(config['checkpoint_dir'], config['name'], "training_samples")
+    os.makedirs(samples_dir, exist_ok=True)
     
     for i in range(len(images)):
         for t in range(config['frames']):
             frame = Image.fromarray(images[i, :, t, :, :].squeeze()).convert('P')
-            frame.save(os.path.join(test_dir, f'{epoch:04d}_s{i:02d}_t{t:02d}.png'))
+            frame.save(os.path.join(samples_dir, f'{epoch:04d}_s{i:02d}_t{t:02d}.png'))
     
     # # output from model is on [-1,1]  scale; convert to [0,255]
     # images = [Image.fromarray(255/2*(np.array(images[i]).squeeze() + 1)) for i in range(config['eval_batch_size'])]
@@ -299,20 +332,26 @@ def evaluate(samples, config, epoch, pipeline):
     # image_grid = make_image_grid(images, rows=4, cols=4)
 
     # # Save the images
-    # image_grid.save(f"{test_dir}/{epoch:04d}.png")
+    # image_grid.save(f"{samples_dir}/{epoch:04d}.png")
     
 def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler):
     accelerator = Accelerator(
         gradient_accumulation_steps=config['gradient_accumulation_steps'],
-        log_with="tensorboard",
-        project_dir=os.path.join(config['output_dir'], "logs"),
+        log_with="wandb",
+        project_dir=os.path.join(config['checkpoint_dir'], config['name'], "logs"),
     )
     
     if accelerator.is_main_process:
-        os.makedirs(config['output_dir'], exist_ok=True)
+        os.makedirs(os.path.join(config['checkpoint_dir'], config['name'],), exist_ok=True)
         accelerator.init_trackers("train_example")
         
-    with open(os.path.join(config['output_dir'], 'config.txt'), 'w') as f:
+    env_file_path = os.path.join(config['checkpoint_dir'], config['name'], 'environment.yml')
+    subprocess.run(f"conda env export > {env_file_path}", shell=True)
+    artifact = wandb.Artifact("conda-env", type="environment")
+    artifact.add_file(env_file_path)
+    wandb.log_artifact(artifact)
+        
+    with open(os.path.join(config['checkpoint_dir'], config['name'], 'config.txt'), 'w') as f:
         str_config = {k:str(v) for k, v in config.items()}
         json.dump(str_config, f, indent=4)
         
@@ -363,7 +402,7 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
             #     break
             
         loss = np.mean(losses)
-        with open(os.path.join(config['output_dir'], 'train_log.txt'), 'a') as f:
+        with open(os.path.join(config['checkpoint_dir'], config['name'], 'train_log.txt'), 'a') as f:
             f.write(f"Epoch {epoch}, Step {global_step}, Loss: {loss}, LR: {logs['lr']}\n")
             
         # sample demo images, save model
@@ -373,11 +412,11 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
                 # get just the first time step/prompt frame
                 evaluate(batch["pixel_values"][:, :, 0, :, :], config, epoch, pipeline)
             if (epoch + 1) % config['save_model_epochs'] == 0 or epoch == config['num_epochs'] - 1: # MODEL
-                pipeline.save_pretrained(config['output_dir'])
+                pipeline.save_pretrained(os.path.join(config['checkpoint_dir'], config['name']))
         
         
 def sample_loop(config, model, noise_scheduler, dataloader):
-    os.makedirs(os.path.join(config['output_dir'], 'samples'), exist_ok=True)
+    os.makedirs(os.path.join(config['checkpoint_dir'], config['name'], 'samples'), exist_ok=True)
     pipeline = CondDiffusionPipeline(unet=model, scheduler=noise_scheduler)
     generator = torch.Generator(device='cuda').manual_seed(config['seed'])
     for batch in tqdm(dataloader):
@@ -391,13 +430,17 @@ def sample_loop(config, model, noise_scheduler, dataloader):
         # output from model is on [-1,1]  scale; convert to [0,255]
         images = 255/2 * ( 1+np.array(images) )
         for i, name in enumerate(batch['name']):
-            os.makedirs(os.path.join(config['output_dir'], 'samples', name), exist_ok=True)
+            os.makedirs(os.path.join(config['checkpoint_dir'], config['name'], 'samples', name), exist_ok=True)
             for t in range(config['frames']):
-                np.save(os.path.join(config['output_dir'], 'samples', name, f'{t}.npy'), 
+                np.save(os.path.join(config['checkpoint_dir'], config['name'], 'samples', name, f'{t}.npy'), 
                         images[i, :, t, :, :])
         
         
 if config['train']:
+    run = wandb.init(
+        project=config['name'],
+        config=config,
+    )
     train_loop(config, unet, noise_scheduler, optimizer, dataloader, lr_scheduler)
 else:
     sample_loop(config, unet, noise_scheduler, dataloader)

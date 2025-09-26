@@ -20,25 +20,34 @@ import subprocess
 import math
 
 
+def comma_separated_ints(value):
+    return [int(x) for x in value.split(",")]
+
+
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--image_size', type=int, default=32, help='the height and the width of the images')
     parser.add_argument('--train_batch_size', type=int, default=8)
     parser.add_argument('--eval_batch_size', type=int, default=8)
-    parser.add_argument('--num_epochs', type=int, default=250, help='if train=True, total number of epochs to train for')
+    parser.add_argument('--epochs', type=int, default=250, help='if train=True, total number of epochs to train for')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=8)
-    parser.add_argument('--learning_rate', type=float, default=1e-7)
+    parser.add_argument('--lr', type=float, default=1e-7)
     parser.add_argument('--lr_warmup_steps', type=int, default=0)
     parser.add_argument('--save_image_epochs', type=int, default=10, help='how often to sample (eval) during training')
     parser.add_argument('--save_model_epochs', type=int, default=10, help='how often to save model during training')
-    parser.add_argument('--name', type=str, default='debug2d', help='name of this run. Directory will be checkpoint_dir+name')
-    parser.add_argument('--checkpoint_dir', type=str, default='/mnt/data/sonia/cyclone/checkpoints/2d')
+    parser.add_argument('--name', type=str, default='debug2d', 
+                        help='name of this run. Directory will be checkpoint_dir+name and wandb will use this name')
+    parser.add_argument('--checkpoint_dir', type=str, default='/hdd3/sonia/cycloneSVD/checkpoints')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--dataset', type=str, required=True, help='path to training data, or val data for sampling')
     parser.add_argument('--continue', type=bool, default=False, 
                         help='if true and training true, attempt to resume training. uses training configs specified here')
     parser.add_argument('--sample', type=int, default=0, help='0 for no sampling, else the number of samples to generate')
+    
+    parser.add_argument('--unet_layers_per_block', type=int, default=2, help='number of conv layers per unet block')
+    parser.add_argument('--unet_block_out_channels', type=comma_separated_ints, default=[32, 64, 128], help='number of channels for unet blocks')
+    parser.add_argument('--unet_cross_attention_dim', type=int, default=768, help='dimension for cross attention layers in unet')
     args = parser.parse_args()
     return args
     
@@ -128,21 +137,21 @@ dataset = DummyDataset(dataset=config['dataset'])
 dataloader = DataLoader(dataset, batch_size=config['train_batch_size'], shuffle=True)
 
 
-cross_attention_dim = 768
+# create the model
 if not config.get('continue', False):
     unet = diffusers.UNet2DConditionModel(
-        sample_size        = 32,      # 32×32 tiles
+        sample_size        = config['image_size'],
         in_channels        = dataset.channels, 
         out_channels       = dataset.channels,
-        block_out_channels = (32, 64, 128),   # 3 resolution scales: 32→16→8
-        layers_per_block   = 2,
+        block_out_channels = config['unet_block_out_channels'],
+        layers_per_block   = config['unet_layers_per_block'],
         down_block_types   = ("CrossAttnDownBlock2D",
                             "CrossAttnDownBlock2D",
                             "DownBlock2D"),
         up_block_types     = ("UpBlock2D",
                             "CrossAttnUpBlock2D",
                             "CrossAttnUpBlock2D"),
-        cross_attention_dim= cross_attention_dim
+        cross_attention_dim= config['unet_cross_attention_dim']
     )
     last_epoch=0
 else: # resume 
@@ -152,16 +161,17 @@ else: # resume
     with open(os.path.join(output_dir, 'train_log.txt'), 'r') as f:
         logs = f.readlines()
     last_epoch = int(logs[-1].split()[1][:-1])
+print(unet)
 
 
-optimizer = torch.optim.AdamW(unet.parameters(), lr=config['learning_rate'])
+optimizer = torch.optim.AdamW(unet.parameters(), lr=config['lr'])
 lr_scheduler = get_cosine_schedule_with_warmup(
     optimizer=optimizer,
     num_warmup_steps=config['lr_warmup_steps'],
-    num_training_steps=(len(dataloader) * config['num_epochs']),
+    num_training_steps=(len(dataloader) * config['epochs']),
 )
 
-zeros = torch.zeros(config['train_batch_size'], 1, cross_attention_dim)
+zeros = torch.zeros(config['train_batch_size'], 1, config['unet_cross_attention_dim'])
 
 class CondDiffusionPipeline(DiffusionPipeline):
     def __init__(self, unet, scheduler):
@@ -233,7 +243,7 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
     )
     
     global_step = 0
-    for epoch in range(last_epoch, config['num_epochs']):
+    for epoch in range(last_epoch, config['epochs']):
         progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch}")
         losses = []
@@ -278,9 +288,9 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
         # sample demo images, save model
         if accelerator.is_main_process:
             pipeline = CondDiffusionPipeline(unet=accelerator.unwrap_model(model).cuda(), scheduler=noise_scheduler)
-            if (epoch + 1) % config['save_image_epochs'] == 0 or epoch == config['num_epochs'] - 1:
+            if (epoch + 1) % config['save_image_epochs'] == 0 or epoch == config['epochs'] - 1:
                 evaluate(config, epoch, pipeline)
-            if (epoch + 1) % config['save_model_epochs'] == 0 or epoch == config['num_epochs'] - 1:
+            if (epoch + 1) % config['save_model_epochs'] == 0 or epoch == config['epochs'] - 1:
                 pipeline.save_pretrained(output_dir)
             
 
@@ -312,7 +322,8 @@ noise_scheduler = diffusers.DDPMScheduler(num_train_timesteps=1000)
 
 if config['train']:
     run = wandb.init(
-        project=config['name'],
+        project='geodes',
+        name=config['name'],
         config=config,
     )
     train_loop(config, unet, noise_scheduler, optimizer, dataloader, lr_scheduler)

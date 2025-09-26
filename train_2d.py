@@ -1,7 +1,4 @@
-# %% [markdown]
 # https://huggingface.co/docs/diffusers/main/en/tutorials/basic_training#train-the-model
-
-# %%
 import diffusers 
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from diffusers.utils import make_image_grid
@@ -17,56 +14,45 @@ from accelerate import Accelerator
 from tqdm.auto import tqdm
 from pathlib import Path
 import json
+import wandb
+import argparse 
+import subprocess
+import math
 
 
-# %%
-config = {
-    'image_size': 32,  # the generated image resolution
-    'train_batch_size': 16,
-    'eval_batch_size': 16,  # how many images to sample during evaluation
-    'num_epochs': 250,
-    'gradient_accumulation_steps': 8,
-    'learning_rate': 1e-7,
-    'lr_warmup_steps': 500,
-    'save_image_epochs': 10,
-    'save_model_epochs': 10,
-    # 'mixed_precision': "fp16",  # `no` for float32, `fp16` for automatic mixed precision
-    'output_dir': "img1e-7",  # the model name locally and on the HF Hub
-    'seed': 0,
-    'dataset': '/home/cyclone/train/windmag_atlanticpacific',
-    'continue': False,
-}
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--train', action='store_true')
+    parser.add_argument('--image_size', type=int, default=32, help='the height and the width of the images')
+    parser.add_argument('--train_batch_size', type=int, default=8)
+    parser.add_argument('--eval_batch_size', type=int, default=8)
+    parser.add_argument('--num_epochs', type=int, default=250, help='if train=True, total number of epochs to train for')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=8)
+    parser.add_argument('--learning_rate', type=float, default=1e-7)
+    parser.add_argument('--lr_warmup_steps', type=int, default=0)
+    parser.add_argument('--save_image_epochs', type=int, default=10, help='how often to sample (eval) during training')
+    parser.add_argument('--save_model_epochs', type=int, default=10, help='how often to save model during training')
+    parser.add_argument('--name', type=str, default='debug2d', help='name of this run. Directory will be checkpoint_dir+name')
+    parser.add_argument('--checkpoint_dir', type=str, default='/mnt/data/sonia/cyclone/checkpoints/2d')
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--dataset', type=str, required=True, help='path to training data, or val data for sampling')
+    parser.add_argument('--continue', type=bool, default=False, 
+                        help='if true and training true, attempt to resume training. uses training configs specified here')
+    parser.add_argument('--sample', type=int, default=0, help='0 for no sampling, else the number of samples to generate')
+    args = parser.parse_args()
+    return args
+    
+    
+args = get_args()
+config = vars(args)
 
-# %%
-cross_attention_dim = 768
-if not config.get('continue', False):
-    unet = diffusers.UNet2DConditionModel(
-        sample_size        = 32,      # 32×32 tiles
-        in_channels        = 1,       # wind magnitude only
-        out_channels       = 1,
-        block_out_channels = (32, 64, 128),   # 3 resolution scales: 32→16→8
-        layers_per_block   = 2,
-        down_block_types   = ("CrossAttnDownBlock2D",
-                            "CrossAttnDownBlock2D",
-                            "DownBlock2D"),
-        up_block_types     = ("UpBlock2D",
-                            "CrossAttnUpBlock2D",
-                            "CrossAttnUpBlock2D"),
-        cross_attention_dim= cross_attention_dim
-    )
-    last_epoch=0
-else: # resume 
-    unet = diffusers.UNet2DConditionModel.from_pretrained(
-        config['output_dir'], subfolder="unet", revision="main"
-    )
-    with open(os.path.join(config['output_dir'], 'train_log.txt'), 'r') as f:
-        logs = f.readlines()
-    last_epoch = int(logs[-1].split()[1][:-1])
+wandb.login()
 
-# %%
+output_dir = os.path.join(args.checkpoint_dir, args.name)
+
+
 class DummyDataset(Dataset):
-    def __init__(self, dataset, 
-                 width=32, height=32, channels=3, sample_frames=8):
+    def __init__(self, dataset, width=32, height=32, sample_frames=8):
         """
         Args:
             num_samples (int): Number of samples in the dataset.
@@ -76,10 +62,26 @@ class DummyDataset(Dataset):
         self.base_folder = dataset
         self.folders = [f for f in os.listdir(self.base_folder) if os.path.isdir(os.path.join(self.base_folder, f))]
         self.num_samples = len(self.folders)
-        self.channels = channels
         self.width = width
         self.height = height
         self.sample_frames = sample_frames
+        
+        # get min, max values for normalization
+        self.min = np.inf
+        self.max = -1 * np.inf
+        for folder in self.folders:
+            for i in range(sample_frames):
+                frame = np.load(os.path.join(self.base_folder, folder, f'{i}.npy'))
+                self.min = min(self.min, frame.min())
+                self.max = max(self.max, frame.max())
+                
+        if frame.ndim == 2:
+            self.channels = 1
+        elif frame.ndim == 3:
+            self.channels = frame.shape[2]
+        else:
+            raise ValueError(f'Frame has invalid number of dimensions, should be 2 or 3 but is {frame.ndim}')
+                
 
     def __len__(self):
         return self.sample_frames * len(self.folders)
@@ -113,14 +115,45 @@ class DummyDataset(Dataset):
                     f"Inf values found in the image tensor for frame {frame_name} in folder {chosen_folder}.")
 
             # Normalize the image by scaling pixel values to [-1, 1]
-            img_normalized = (img_tensor / img_tensor.max() * 2) -1.0
+            # img_normalized = (img_tensor / img_tensor.max() * 2) -1.0
+            img_normalized = 2 * (img_tensor-self.min) / (self.max - self.min) - 1.0
+            img_normalized[img_normalized<-1] = -1 # in case of rounding errors
+            img_normalized[img_normalized>1] = 1
 
-        return {'pixel_values': img_normalized.unsqueeze(0)}
+        if self.channels == 1:
+            img_normalized = img_normalized.unsqueeze(0)
+        return {'pixel_values': img_normalized}
     
-dataset = DummyDataset(dataset=config['dataset'], channels=1)
-dataloader = DataLoader(dataset, batch_size=16, shuffle=True)
+dataset = DummyDataset(dataset=config['dataset'])
+dataloader = DataLoader(dataset, batch_size=config['train_batch_size'], shuffle=True)
 
-# %%
+
+cross_attention_dim = 768
+if not config.get('continue', False):
+    unet = diffusers.UNet2DConditionModel(
+        sample_size        = 32,      # 32×32 tiles
+        in_channels        = dataset.channels, 
+        out_channels       = dataset.channels,
+        block_out_channels = (32, 64, 128),   # 3 resolution scales: 32→16→8
+        layers_per_block   = 2,
+        down_block_types   = ("CrossAttnDownBlock2D",
+                            "CrossAttnDownBlock2D",
+                            "DownBlock2D"),
+        up_block_types     = ("UpBlock2D",
+                            "CrossAttnUpBlock2D",
+                            "CrossAttnUpBlock2D"),
+        cross_attention_dim= cross_attention_dim
+    )
+    last_epoch=0
+else: # resume 
+    unet = diffusers.UNet2DConditionModel.from_pretrained(
+        output_dir, subfolder="unet", revision="main"
+    )
+    with open(os.path.join(output_dir, 'train_log.txt'), 'r') as f:
+        logs = f.readlines()
+    last_epoch = int(logs[-1].split()[1][:-1])
+
+
 optimizer = torch.optim.AdamW(unet.parameters(), lr=config['learning_rate'])
 lr_scheduler = get_cosine_schedule_with_warmup(
     optimizer=optimizer,
@@ -152,7 +185,7 @@ class CondDiffusionPipeline(DiffusionPipeline):
         return {"images": sample.cpu()}
         
 
-# %%
+
 def evaluate(config, epoch, pipeline):
     # Sample some images from random noise (this is the backward diffusion process).
     # The default pipeline output type is `List[PIL.Image]`
@@ -164,31 +197,35 @@ def evaluate(config, epoch, pipeline):
     )['images']
     # print(images.shape, np.array(images[0]).squeeze().shape)
     
-    # output from model is on [-1,1]  scale; convert to [0,255]
+    # output from model is on [-1,1]  scale; convert to [0,255] for visualization
     images = [Image.fromarray(255/2*(np.array(images[i]).squeeze() + 1)) for i in range(config['eval_batch_size'])]
 
     # Make a grid out of the images
-    image_grid = make_image_grid(images, rows=4, cols=4)
+    image_grid = make_image_grid(images, rows=1, cols=config['eval_batch_size'])
 
     # Save the images
-    test_dir = os.path.join(config['output_dir'], "samples")
+    test_dir = os.path.join(output_dir, "train_samples")
     os.makedirs(test_dir, exist_ok=True)
     image_grid.save(f"{test_dir}/{epoch:04d}.png")
 
-# %%
+
 def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler):
     accelerator = Accelerator(
-        # mixed_precision=config['mixed_precision'],
         gradient_accumulation_steps=config['gradient_accumulation_steps'],
-        log_with="tensorboard",
-        project_dir=os.path.join(config['output_dir'], "logs"),
+        log_with="wandb",
+        project_dir=os.path.join(output_dir, "logs"),
     )
     if accelerator.is_main_process:
-        if config['output_dir'] is not None:
-            os.makedirs(config['output_dir'], exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
         accelerator.init_trackers("train_example")
+        
+    env_file_path = os.path.join(output_dir, 'environment.yml')
+    subprocess.run(f"conda env export > {env_file_path}", shell=True)
+    artifact = wandb.Artifact("conda-env", type="environment")
+    artifact.add_file(env_file_path)
+    wandb.log_artifact(artifact)
     
-    with open(os.path.join(config['output_dir'], 'config.txt'), 'w') as f:
+    with open(os.path.join(output_dir, 'config.txt'), 'w') as f:
         json.dump(config, f, indent=4)
         
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -233,7 +270,9 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
             global_step += 1
             
         loss = np.mean(losses)
-        with open(os.path.join(config['output_dir'], 'train_log.txt'), 'a') as f:
+        wandb.log({'epoch_loss': loss, 'epoch': epoch}, step=global_step)
+        progress_bar.set_postfix(**{"loss": loss, "lr": lr_scheduler.get_last_lr()[0], "step": global_step})
+        with open(os.path.join(output_dir, 'train_log.txt'), 'a') as f:
             f.write(f"Epoch {epoch}, Step {global_step}, Loss: {loss}, LR: {logs['lr']}\n")
         
         # sample demo images, save model
@@ -242,8 +281,41 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
             if (epoch + 1) % config['save_image_epochs'] == 0 or epoch == config['num_epochs'] - 1:
                 evaluate(config, epoch, pipeline)
             if (epoch + 1) % config['save_model_epochs'] == 0 or epoch == config['num_epochs'] - 1:
-                pipeline.save_pretrained(config['output_dir'])
+                pipeline.save_pretrained(output_dir)
             
-noise_scheduler = diffusers.DDPMScheduler(num_train_timesteps=1000)
-train_loop(config, unet, noise_scheduler, optimizer, dataloader, lr_scheduler)
 
+def sample_loop(config, model, noise_scheduler):
+    os.makedirs(os.path.join(config['checkpoint_dir'], config['name'], 'samples'), exist_ok=True)
+    pipeline = CondDiffusionPipeline(unet=model.cuda(), scheduler=noise_scheduler)
+    n_batches = math.ceil(config['sample'] / config['eval_batch_size'])
+    generator = torch.Generator(device='cuda').manual_seed(config['seed'])
+    
+    batches = []
+    for _ in range(n_batches):
+        batch_out = pipeline(
+            batch_size=config['eval_batch_size'],
+            generator=generator, 
+            encoder_hidden_states=zeros.to('cuda'),
+        )['images']
+        batches.append(batch_out)
+        
+    images = torch.cat(batches, dim=0)[:config['sample']].squeeze() # on [-1, 1] scale
+    images = (images + 1)/2 * (dataset.max - dataset.min) + dataset.min # [dataset min, dataset max] scale
+    images = images.cpu().numpy() 
+    
+    for i in range(config['sample']):
+        np.save(os.path.join(config['checkpoint_dir'], config['name'], 'samples', f'{i}.npy'), images[i])
+    
+
+
+noise_scheduler = diffusers.DDPMScheduler(num_train_timesteps=1000)
+
+if config['train']:
+    run = wandb.init(
+        project=config['name'],
+        config=config,
+    )
+    train_loop(config, unet, noise_scheduler, optimizer, dataloader, lr_scheduler)
+
+if config['sample'] > 0:
+    sample_loop(config, unet, noise_scheduler)

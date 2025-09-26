@@ -46,6 +46,7 @@ def get_args():
     parser.add_argument('--img_model', type=str, 
                         default=None, help='if training video from scratch, builds from this image model')
     parser.add_argument('--correlated_noise', type=float, default=0.95, help='0 is iid noise')
+    # parser.add_argument('--sample', type=int, default=0, help='0 for no sampling, else the number of samples to generate')
     args = parser.parse_args()
     return args
 
@@ -54,29 +55,6 @@ config = vars(args)
 config['dtype'] = torch.float32
 
 wandb.login()
-
-# config = {
-#     'train': True,
-#     'image_size': 32,  # the generated image resolution
-#     'train_batch_size': 8,
-#     'eval_batch_size': 1,  # how many images to sample during evaluation
-#     'num_epochs': 250,
-#     'gradient_accumulation_steps': 8,
-#     'learning_rate': 1e-7,
-#     'lr_warmup_steps': 0,
-#     'save_image_epochs': 10,
-#     'save_model_epochs': 10,
-#     'name': "debug", #will be saved to checkpoint_dir+name
-#     'checkpoint_dir': '/mnt/data/sonia/cyclone/checkpoints',
-#     'seed': 0,
-#     'dataset': '/home/cyclone/train/windmag/10m/natlantic2/val',
-#     'channels': 1, # channels in the images
-#     'frames': 8,
-#     'continue': False,
-#     'img_model': 'img1e-7',
-#     'dtype': torch.float32,
-#     'correlated_noise': 0.95, # 0 is iid
-# }
 
 
 class DummyDataset(Dataset):
@@ -333,6 +311,7 @@ def evaluate(samples, config, epoch, pipeline):
 
     # # Save the images
     # image_grid.save(f"{samples_dir}/{epoch:04d}.png")
+ 
     
 def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler):
     accelerator = Accelerator(
@@ -417,7 +396,7 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
         
 def sample_loop(config, model, noise_scheduler, dataloader):
     os.makedirs(os.path.join(config['checkpoint_dir'], config['name'], 'samples'), exist_ok=True)
-    pipeline = CondDiffusionPipeline(unet=model, scheduler=noise_scheduler)
+    pipeline = CondDiffusionPipeline(unet=model.cuda(), scheduler=noise_scheduler)
     generator = torch.Generator(device='cuda').manual_seed(config['seed'])
     for batch in tqdm(dataloader):
         prompt = batch['pixel_values'][:, :, 0, :, :]
@@ -427,8 +406,10 @@ def sample_loop(config, model, noise_scheduler, dataloader):
             generator=generator, 
             encoder_hidden_states=torch.zeros((config['train_batch_size'], 1, cross_attention_dim), device='cuda')
         )['images']
-        # output from model is on [-1,1]  scale; convert to [0,255]
-        images = 255/2 * ( 1+np.array(images) )
+        
+        # # output from model is on [-1,1]  scale; convert to [dataset min, dataset max]
+        # images = 255/2 * ( 1+np.array(images) )
+        images = (images + 1)/2 * (dataset.max - dataset.min) + dataset.min
         for i, name in enumerate(batch['name']):
             os.makedirs(os.path.join(config['checkpoint_dir'], config['name'], 'samples', name), exist_ok=True)
             for t in range(config['frames']):
@@ -444,3 +425,4 @@ if config['train']:
     train_loop(config, unet, noise_scheduler, optimizer, dataloader, lr_scheduler)
 else:
     sample_loop(config, unet, noise_scheduler, dataloader)
+    
